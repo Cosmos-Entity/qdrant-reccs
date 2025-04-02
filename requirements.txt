@@ -1,0 +1,6 @@
+transformers
+tqdm
+scikit-learn
+torch
+awswrangler
+qdrant-client
