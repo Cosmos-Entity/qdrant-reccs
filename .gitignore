@@ -1,0 +1,28 @@
+# Snapshot files
+*.snapshot
+
+# Extracted data directories
+extracted_elements_data/
+extracted_users_data/
+qdrant_snapshots/
+snapshot/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+env/
+.env/
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS specific files
+.DS_Store
+Thumbs.db 
