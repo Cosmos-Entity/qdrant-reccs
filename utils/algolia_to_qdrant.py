@@ -10,6 +10,8 @@ import pandas as pd
 from tqdm import tqdm
 import logging
 import sys
+import concurrent.futures
+import torch
 
 # Get absolute path to the parent directory
 parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -31,6 +33,50 @@ from utils.image_utils import url_to_base64, download_image
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# Define weight combinations for different vector strategies
+WEIGHT_COMBINATIONS = [
+    (0.33, 0.33, 0.34),  # Equal weights
+    (0.6, 0.2, 0.2),     # Image-focused
+    (0.2, 0.6, 0.2),     # Text-focused
+    (0.2, 0.2, 0.6)      # Metadata-focused
+]
+
+def combine_vectors_with_weights(image_vector, text_vector, metadata_vector, weights):
+    """
+    Combine vectors using specified weights.
+    
+    Args:
+        image_vector: Image embedding vector
+        text_vector: Text embedding vector
+        metadata_vector: Metadata embedding vector
+        weights: Tuple of (image_weight, text_weight, metadata_weight)
+        
+    Returns:
+        Combined vector
+    """
+    # Convert to numpy arrays if they're not already
+    if isinstance(image_vector, torch.Tensor):
+        image_vector = image_vector.detach().cpu().numpy()
+    if isinstance(text_vector, torch.Tensor):
+        text_vector = text_vector.detach().cpu().numpy()
+    if isinstance(metadata_vector, torch.Tensor):
+        metadata_vector = metadata_vector.detach().cpu().numpy()
+    
+    # Combine vectors using weights
+    image_weight, text_weight, metadata_weight = weights
+    combined = (
+        image_weight * image_vector +
+        text_weight * text_vector +
+        metadata_weight * metadata_vector
+    )
+    
+    # Normalize the combined vector
+    norm = np.linalg.norm(combined)
+    if norm > 0:
+        combined = combined / norm
+    
+    return combined
 
 class AlgoliaToQdrantMigrator:
     """
@@ -93,7 +139,10 @@ class AlgoliaToQdrantMigrator:
             self.qdrant_client.create_collection(
                 collection_name=self.qdrant_collection,
                 vectors_config={
-                    "combined": models.VectorParams(size=1024, distance=models.Distance.COSINE),
+                    "combined_equal": models.VectorParams(size=1024, distance=models.Distance.COSINE),
+                    "combined_image": models.VectorParams(size=1024, distance=models.Distance.COSINE),
+                    "combined_text": models.VectorParams(size=1024, distance=models.Distance.COSINE),
+                    "combined_metadata": models.VectorParams(size=1024, distance=models.Distance.COSINE),
                     "image": models.VectorParams(size=1024, distance=models.Distance.COSINE),
                     "text": models.VectorParams(size=1024, distance=models.Distance.COSINE),
                     "metadata": models.VectorParams(size=1024, distance=models.Distance.COSINE)
@@ -160,10 +209,40 @@ class AlgoliaToQdrantMigrator:
                 # Process the item using ThreeVectorEmbedding
                 vectors = self.three_vector_embedding.process_item(item)
                 
+                # Get the individual vectors
+                image_vector = vectors["image_vector"]
+                text_vector = vectors["text_vector"]
+                metadata_vector = vectors["metadata_vector"]
+                
+                # Create combined vectors with different weight strategies
+                combined_vectors = {
+                    "combined_equal": combine_vectors_with_weights(
+                        image_vector, text_vector, metadata_vector, WEIGHT_COMBINATIONS[0]
+                    ),
+                    "combined_image": combine_vectors_with_weights(
+                        image_vector, text_vector, metadata_vector, WEIGHT_COMBINATIONS[1]
+                    ),
+                    "combined_text": combine_vectors_with_weights(
+                        image_vector, text_vector, metadata_vector, WEIGHT_COMBINATIONS[2]
+                    ),
+                    "combined_metadata": combine_vectors_with_weights(
+                        image_vector, text_vector, metadata_vector, WEIGHT_COMBINATIONS[3]
+                    ),
+                    "image": image_vector,
+                    "text": text_vector,
+                    "metadata": metadata_vector
+                }
+                
                 # Prepare payload - combine original data with processed metadata
                 payload = {
                     "metadata_str": metadata_str,
-                    "processed_at": time.time()
+                    "processed_at": time.time(),
+                    "weight_combinations": {
+                        "equal": WEIGHT_COMBINATIONS[0],
+                        "image_focused": WEIGHT_COMBINATIONS[1],
+                        "text_focused": WEIGHT_COMBINATIONS[2],
+                        "metadata_focused": WEIGHT_COMBINATIONS[3]
+                    }
                 }
                 
                 # Add the generated caption to the payload if available
@@ -181,12 +260,7 @@ class AlgoliaToQdrantMigrator:
                     points=[
                         models.PointStruct(
                             id=int(element_id),
-                            vector={
-                                "combined": vectors["combined_vector"],
-                                "image": vectors["image_vector"],
-                                "text": vectors["text_vector"],
-                                "metadata": vectors["metadata_vector"]
-                            },
+                            vector=combined_vectors,
                             payload=payload
                         )
                     ]
