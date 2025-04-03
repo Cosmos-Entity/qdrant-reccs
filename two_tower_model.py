@@ -15,6 +15,8 @@ import random
 from sklearn.metrics import roc_auc_score, average_precision_score
 import matplotlib.pyplot as plt
 from qdrant_client import QdrantClient
+import tarfile
+
 
 class UserTower(nn.Module):
     """

@@ -9,15 +9,19 @@ from typing import List, Dict, Tuple, Optional, Union, Any
 from transformers import CLIPTextModel, CLIPTokenizer, CLIPProcessor, CLIPModel
 from transformers import AutoTokenizer, AutoModel
 import openai
+from utils.image_utils import url_to_base64
 import os
 import json
 from sklearn.preprocessing import normalize
+import datetime
+import requests
+from io import BytesIO
 
 class LLMCaptionGenerator:
     """
     Generate captions for images using LLM.
     """
-    def __init__(self, api_key=None, model="gpt-4o"):
+    def __init__(self, api_key=None, model="o1"):
         if api_key:
             openai.api_key = api_key
         elif os.environ.get("OPENAI_API_KEY"):
@@ -27,107 +31,393 @@ class LLMCaptionGenerator:
             
         self.model = model
         self.prompt_template = """
-        You are an expert Cosmos reviewer. Please provide a detailed description of the image.
-        
-        Consider the following aspects:
-        - Main subject and visual content
-        - Style and composition
-        - Colors and aesthetics
-        - Emotional impact
-        - Technical quality (focus, lighting)
-        
-        Please rate the following on a scale of 1-10:
-        - Composition: 
-        - Technical Quality: 
-        - Artistic Value: 
-        - Originality: 
-        
-        If the image contains any inappropriate content (nudity, violence, offensive material),
-        indicate this with a content warning.
-        
-        Provide your full analysis in 3-5 sentences.
-        """
+        You are an unflinchingly honest reviewer who adapts to different types of images and art forms. Begin by determining whether the image is:
+        1.	Serious Artwork or Photograph (e.g., fine art, editorial, design, conceptual):
+            •	Detailed Critical Analysis (concisely, in 3-5 sentences) focusing on when appropriate:
+                •	Main Subject & Visual Content: Precisely describe the subjects and notable elements.
+                •	Style & Composition: Use advanced artistic or photographic terminology (e.g., "chiaroscuro," "Dutch angle," "golden ratio," "bokeh," "postmodern," "Baroque influence") where relevant. Mention any recognizable time period, movement, or technique (e.g., Renaissance, Pop Art, Minimalist). If you suspect a certain camera type or lens, feel free to note it.
+                •	Colors & Aesthetics: The color palette's harmony or discord, calling out clichés or praising truly innovative choices.
+                •	Emotional Impact: The intended mood, noting if it's truly evocative or falls flat.
+                •	Technical Quality: Assess focus, lighting, post-processing, and any advanced or flawed techniques.
+            •	Ratings (1–10):
+                •	Composition
+                •	Technical Quality
+                •	Artistic Value (skew toward originality, depth, and sophistication)
+                •	Originality (penalize clichés and "cheuggy" trends; reward fresh ideas)
+                •	Format: In 1-2 sentences, provide an honest, well-reasoned critique (with genuine praise only where earned). Avoid empty flattery, but do not hesitate to acknowledge a truly exceptional piece.
+        2.	Casual Photo, Meme, Selfie, or Otherwise Non-Art
+            •	Brief Description: Summarize what's happening or who is pictured (if clear). Note if it's funny, dull, mundane, cringe, etc.
+            •	Concise Feedback: No need for deep composition or color theory critiques. Only mention basics if relevant (e.g., blatantly poor lighting or focus).
+
+        Overall Guidelines:
+            •	Stay unfiltered, direct, and avoid hollow niceties.
+            •	Provide technical or historical insight where appropriate—if the style suggests a known era, method, or movement, mention it.
+            •	Critique fairly: highlight strengths if they truly exist, yet be brutally honest about mediocrity, clichés, or overdone aesthetics.
+                    """
     
-    def generate_caption(self, image_url: str) -> str:
+    def  generate_caption(self, image_url: str) -> str:
         """
         Generate a caption for the image using the LLM.
-        
-        In a real implementation, this would send the image to OpenAI's API.
-        For this example, we'll simulate by returning a placeholder.
         """
-        # In a real implementation, this would call the OpenAI API with the image
-        # response = openai.ChatCompletion.create(
-        #     model=self.model,
-        #     messages=[
-        #         {"role": "system", "content": self.prompt_template},
-        #         {"role": "user", "content": [
-        #             {"type": "image_url", "image_url": {"url": image_url}}
-        #         ]}
-        #     ]
-        # )
-        # return response.choices[0].message.content
+        # Using the new OpenAI API format (1.0.0+)
+        client = openai.OpenAI(api_key=openai.api_key)
+
+        # Ensure image URL ends with ?format=jpeg
+        if not image_url.endswith("?format=jpeg"):
+            image_url = f"{image_url}?format=jpeg"
+
+        base64_url = url_to_base64(image_url)
         
-        # For this example, we'll return a placeholder caption
-        return "A high-quality professionally composed image with warm tones. The composition is balanced with careful attention to lighting. Composition: 8, Technical Quality: 9, Artistic Value: 7, Originality: 6."
+        response = client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": self.prompt_template},
+                {"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": base64_url}}
+                ]}
+            ]
+        )
+        return response.choices[0].message.content
 
 class TextEmbeddingModel:
     """
     Generate text embeddings using a model other than CLIP.
     """
-    def __init__(self, model_name="sentence-transformers/all-mpnet-base-v2"):
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.model = AutoModel.from_pretrained(model_name)
+    def __init__(self, model_name="BAAI/bge-large-en-v1.5"):
+        from transformers import AutoTokenizer, AutoModel
+        self.model_name = model_name
+        self.tokenizer = None
+        self.model = None
+        # Lazy loading - will load when first needed
         
+    def _ensure_model_loaded(self):
+        """
+        Ensure the model and tokenizer are loaded.
+        Implements lazy loading to save memory until needed.
+        """
+        if self.model is None or self.tokenizer is None:
+            from transformers import AutoTokenizer, AutoModel
+            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+            self.model = AutoModel.from_pretrained(self.model_name)
+            self.model.eval()  # Set to evaluation mode
+    
     def get_embedding(self, text: str) -> torch.Tensor:
         """
-        Generate an embedding for the text.
+        Generate an embedding for the text using BGE model.
+        
+        Args:
+            text: Input text to embed
+            
+        Returns:
+            Text embedding tensor
         """
-        inputs = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=512)
+        return self.get_embeddings_batch([text]).squeeze()
+    
+    def get_embeddings_batch(self, texts: List[str]) -> torch.Tensor:
+        """
+        Generate embeddings for a batch of texts.
+        
+        Args:
+            texts: List of input texts to embed
+            
+        Returns:
+            Batch of text embedding tensors
+        """
+        self._ensure_model_loaded()
+        
+        # Prepare inputs
+        inputs = self.tokenizer(
+            texts, 
+            return_tensors="pt", 
+            padding=True, 
+            truncation=True, 
+            max_length=512
+        )
+        
+        # Generate embeddings
         with torch.no_grad():
             outputs = self.model(**inputs)
-        
-        # Use mean pooling of the last hidden state as the embedding
-        embeddings = outputs.last_hidden_state.mean(dim=1)
-        return embeddings.squeeze()
+            
+            # For BGE models, use the [CLS] token embedding (first token)
+            embeddings = outputs.last_hidden_state[:, 0]
+            
+            # Normalize embeddings (important for BGE models)
+            embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=1)
+            
+        return embeddings
+
 
 class MetadataProcessor:
     """
-    Process metadata into a standardized format for embedding.
+    Process metadata into a format optimized for text embedding models.
+    Structured for BGE and similar embedding models.
     """
     def __init__(self):
-        pass
-    ``
-    def process_metadata(self, metadata: Dict) -> str:
+        self.max_tags = 50
+        self.max_colors = 10
+    
+    def process_metadata(self, metadata: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
         """
-        Convert metadata dictionary to a string for embedding.
+        Convert metadata dictionary to a structured string for embedding and a clean dictionary.
+        
+        Args:
+            metadata: Raw metadata dictionary
+            
+        Returns:
+            Tuple of (formatted_string, processed_metadata_dict)
         """
-        metadata_str = ""
+        parts = []
+        processed_dict = {}
         
-        # Process different metadata fields
-        if "tags" in metadata:
-            metadata_str += f"Tags: {', '.join(metadata['tags'])}. "
+        # ===== Basic Content Type and Source =====
+        # These fields define what the item fundamentally is
+        if metadata.get("contentType"):
+            parts.append(f"contentType={metadata['contentType']}")
+            processed_dict["contentType"] = metadata["contentType"]
         
-        if "category" in metadata:
-            metadata_str += f"Category: {metadata['category']}. "
-            
-        if "author" in metadata:
-            metadata_str += f"Author: {metadata['author']}. "
-            
-        if "date" in metadata:
-            metadata_str += f"Date: {metadata['date']}. "
-            
-        if "location" in metadata:
-            metadata_str += f"Location: {metadata['location']}. "
-            
-        if "device" in metadata:
-            metadata_str += f"Device: {metadata['device']}. "
-            
-        if "settings" in metadata:
-            settings = metadata["settings"]
-            settings_str = ", ".join([f"{k}: {v}" for k, v in settings.items()])
-            metadata_str += f"Settings: {settings_str}. "
+        if metadata.get("type"):
+            parts.append(f"type={metadata['type']}")
+            processed_dict["type"] = metadata["type"]
         
-        return metadata_str.strip()
+        if metadata.get("createdAt"):
+            parts.append(f"createdAt={metadata['createdAt']}")
+            processed_dict["createdAt"] = metadata["createdAt"]
+        
+        # ===== Visual Content Tags and Colors =====
+        # Computer vision tags (critical for visual search)
+        if metadata.get("tags"):
+            tags = metadata["tags"][:self.max_tags]
+            parts.append(f"tags=[{' '.join(tags)}]")
+            processed_dict["tags"] = tags
+        
+        # Dominant colors
+        if metadata.get("colors"):
+            colors = metadata["colors"][:self.max_colors]
+            parts.append(f"colors=[{' '.join(colors)}]")
+            processed_dict["colors"] = colors
+        
+        # ===== User-Added Tags =====
+        if metadata.get("userTags"):
+            all_user_tags = []
+            for tag_item in metadata["userTags"]:
+                if "tags" in tag_item and tag_item["tags"]:
+                    all_user_tags.extend(tag_item["tags"])
+            
+            if all_user_tags:
+                unique_user_tags = list(set(all_user_tags))[:self.max_tags]
+                parts.append(f"userTags=[{' '.join(unique_user_tags)}]")
+                processed_dict["userTags"] = unique_user_tags
+        
+        # ===== Source Platform Information =====
+        
+        # Instagram
+        if metadata.get("instagramAuthorFullName"):
+            parts.append(f"instagramAuthorFullName={metadata['instagramAuthorFullName']}")
+            processed_dict["instagramAuthorFullName"] = metadata["instagramAuthorFullName"]
+        
+        if metadata.get("instagramAuthorName"):
+            parts.append(f"instagramAuthorName={metadata['instagramAuthorName']}")
+            processed_dict["instagramAuthorName"] = metadata["instagramAuthorName"]
+        
+        if metadata.get("instagramCaption"):
+            caption = metadata["instagramCaption"].replace('\n', ' ')
+            parts.append(f"instagramCaption={caption}")
+            processed_dict["instagramCaption"] = caption
+        
+        if metadata.get("instagramContentAccessibility"):
+            parts.append(f"instagramContentAccessibility={metadata['instagramContentAccessibility']}")
+            processed_dict["instagramContentAccessibility"] = metadata["instagramContentAccessibility"]
+        
+        if "isInstagramCarousel" in metadata:
+            parts.append(f"isInstagramCarousel={metadata['isInstagramCarousel']}")
+            processed_dict["isInstagramCarousel"] = metadata["isInstagramCarousel"]
+        
+        # YouTube
+        if metadata.get("youtubeTitle"):
+            parts.append(f"youtubeTitle={metadata['youtubeTitle']}")
+            processed_dict["youtubeTitle"] = metadata["youtubeTitle"]
+        
+        if metadata.get("youtubeAuthorName"):
+            parts.append(f"youtubeAuthorName={metadata['youtubeAuthorName']}")
+            processed_dict["youtubeAuthorName"] = metadata["youtubeAuthorName"]
+        
+        # TikTok
+        if metadata.get("tikTokAuthorName"):
+            parts.append(f"tikTokAuthorName={metadata['tikTokAuthorName']}")
+            processed_dict["tikTokAuthorName"] = metadata["tikTokAuthorName"]
+        
+        # Twitter
+        if metadata.get("twitterAuthorName"):
+            parts.append(f"twitterAuthorName={metadata['twitterAuthorName']}")
+            processed_dict["twitterAuthorName"] = metadata["twitterAuthorName"]
+        
+        if metadata.get("twitterAuthorUsername"):
+            parts.append(f"twitterAuthorUsername={metadata['twitterAuthorUsername']}")
+            processed_dict["twitterAuthorUsername"] = metadata["twitterAuthorUsername"]
+        
+        if "isTwitterCarousel" in metadata:
+            parts.append(f"isTwitterCarousel={metadata['isTwitterCarousel']}")
+            processed_dict["isTwitterCarousel"] = metadata["isTwitterCarousel"]
+        
+        # Pinterest
+        if metadata.get("pinterestAuthorName"):
+            parts.append(f"pinterestAuthorName={metadata['pinterestAuthorName']}")
+            processed_dict["pinterestAuthorName"] = metadata["pinterestAuthorName"]
+        
+        if metadata.get("pinterestAuthorUsername"):
+            parts.append(f"pinterestAuthorUsername={metadata['pinterestAuthorUsername']}")
+            processed_dict["pinterestAuthorUsername"] = metadata["pinterestAuthorUsername"]
+        
+        # URLs
+        if metadata.get("url"):
+            parts.append(f"url={metadata['url']}")
+            processed_dict["url"] = metadata["url"]
+        
+        if metadata.get("sourceUrl") and metadata.get("sourceUrl") != metadata.get("url"):
+            parts.append(f"sourceUrl={metadata['sourceUrl']}")
+            processed_dict["sourceUrl"] = metadata["sourceUrl"]
+        
+        # ===== Media-Specific Content =====
+        
+        # Product information
+        if metadata.get("productBrand"):
+            parts.append(f"productBrand={metadata['productBrand']}")
+            processed_dict["productBrand"] = metadata["productBrand"]
+        
+        if metadata.get("productTitle"):
+            parts.append(f"productTitle={metadata['productTitle']}")
+            processed_dict["productTitle"] = metadata["productTitle"]
+        
+        if metadata.get("productDescription"):
+            desc = metadata["productDescription"].replace('\n', ' ')
+            parts.append(f"productDescription={desc}")
+            processed_dict["productDescription"] = desc
+        
+        # Article information
+        if metadata.get("articleTitle"):
+            parts.append(f"articleTitle={metadata['articleTitle']}")
+            processed_dict["articleTitle"] = metadata["articleTitle"]
+        
+        if metadata.get("articleDescription"):
+            desc = metadata["articleDescription"].replace('\n', ' ')
+            parts.append(f"articleDescription={desc}")
+            processed_dict["articleDescription"] = desc
+        
+        # Movie information
+        if metadata.get("movieTitle"):
+            parts.append(f"movieTitle={metadata['movieTitle']}")
+            processed_dict["movieTitle"] = metadata["movieTitle"]
+        
+        if metadata.get("movieYear"):
+            parts.append(f"movieYear={metadata['movieYear']}")
+            processed_dict["movieYear"] = metadata["movieYear"]
+        
+        # Text within image (OCR)
+        if metadata.get("textWithinImage"):
+            text = metadata["textWithinImage"].replace('\n', ' ')
+            parts.append(f"textWithinImage={text}")
+            processed_dict["textWithinImage"] = text
+        
+        # ===== Engagement & Relation Information =====
+        if "isPrivate" in metadata:
+            parts.append(f"isPrivate={metadata['isPrivate']}")
+            processed_dict["isPrivate"] = metadata["isPrivate"]
+        
+        if "numberOfConnections" in metadata and metadata["numberOfConnections"] is not None:
+            parts.append(f"numberOfConnections={metadata['numberOfConnections']}")
+            processed_dict["numberOfConnections"] = metadata["numberOfConnections"]
+        
+        if metadata.get("publicUserIds"):
+            parts.append(f"publicUserCount={len(metadata['publicUserIds'])}")
+            processed_dict["publicUserCount"] = len(metadata['publicUserIds'])
+            processed_dict["publicUserIds"] = metadata["publicUserIds"]
+        
+        if metadata.get("contextualSearchUserIds"):
+            parts.append(f"contextualSearchUserCount={len(metadata['contextualSearchUserIds'])}")
+            processed_dict["contextualSearchUserCount"] = len(metadata['contextualSearchUserIds'])
+            processed_dict["contextualSearchUserIds"] = metadata["contextualSearchUserIds"]
+        
+        if metadata.get("categoryIds"):
+            # Include count
+            parts.append(f"categoryCount={len(metadata['categoryIds'])}")
+            processed_dict["categoryCount"] = len(metadata['categoryIds'])
+            
+            # Include specific IDs if not too many
+            if len(metadata["categoryIds"]) > 0 and len(metadata["categoryIds"]) <= 10:
+                cat_ids = [str(cid) for cid in metadata["categoryIds"]]
+                parts.append(f"categoryIds=[{' '.join(cat_ids)}]")
+                processed_dict["categoryIds"] = metadata["categoryIds"]
+        
+        # ===== Cluster & Owner Information =====
+        if metadata.get("originalCluster") and isinstance(metadata["originalCluster"], dict):
+            cluster = metadata["originalCluster"]
+            processed_dict["originalCluster"] = cluster
+            
+            if "id" in cluster:
+                parts.append(f"originalClusterId={cluster['id']}")
+                processed_dict["originalClusterId"] = cluster['id']
+            
+            if "isBanned" in cluster:
+                parts.append(f"isClusterBanned={cluster['isBanned']}")
+                processed_dict["isClusterBanned"] = cluster['isBanned']
+            
+            if "isAesthetic" in cluster and cluster["isAesthetic"] is not None:
+                parts.append(f"isClusterAesthetic={cluster['isAesthetic']}")
+                processed_dict["isClusterAesthetic"] = cluster["isAesthetic"]
+        
+        if metadata.get("ownerId"):
+            parts.append(f"ownerId={metadata['ownerId']}")
+            processed_dict["ownerId"] = metadata["ownerId"]
+        
+        if "isOwnerBanned" in metadata and metadata["isOwnerBanned"] is not None:
+            parts.append(f"isOwnerBanned={metadata['isOwnerBanned']}")
+            processed_dict["isOwnerBanned"] = metadata["isOwnerBanned"]
+        
+        # ===== Safety & Moderation Information =====
+        if "isNotSafeForWork" in metadata:
+            parts.append(f"isNotSafeForWork={metadata['isNotSafeForWork']}")
+            processed_dict["isNotSafeForWork"] = metadata["isNotSafeForWork"]
+        
+        if metadata.get("notSafeForWorkStatus"):
+            parts.append(f"notSafeForWorkStatus={metadata['notSafeForWorkStatus']}")
+            processed_dict["notSafeForWorkStatus"] = metadata["notSafeForWorkStatus"]
+        
+        # Include all available scores
+        if "aiGeneratedScore" in metadata and metadata["aiGeneratedScore"] is not None:
+            parts.append(f"aiGeneratedScore={metadata['aiGeneratedScore']}")
+            processed_dict["aiGeneratedScore"] = metadata["aiGeneratedScore"]
+        
+        if "explicitNsfwScore" in metadata and metadata["explicitNsfwScore"] is not None:
+            parts.append(f"explicitNsfwScore={metadata['explicitNsfwScore']}")
+            processed_dict["explicitNsfwScore"] = metadata["explicitNsfwScore"]
+        
+        if "suggestiveNsfwScore" in metadata and metadata["suggestiveNsfwScore"] is not None:
+            parts.append(f"suggestiveNsfwScore={metadata['suggestiveNsfwScore']}")
+            processed_dict["suggestiveNsfwScore"] = metadata["suggestiveNsfwScore"]
+        
+        # ===== Image Properties =====
+        if metadata.get("image") and isinstance(metadata["image"], dict):
+            img = metadata["image"]
+            processed_dict["image"] = img
+            
+            if "width" in img and "height" in img:
+                parts.append(f"imageDimensions={img['width']}x{img['height']}")
+                processed_dict["imageDimensions"] = f"{img['width']}x{img['height']}"
+                processed_dict["imageWidth"] = img['width']
+                processed_dict["imageHeight"] = img['height']
+            
+            if "isAnimated" in img:
+                parts.append(f"isAnimated={img['isAnimated']}")
+                processed_dict["isAnimated"] = img['isAnimated']
+            
+            if "hash" in img:
+                parts.append(f"imageHash={img['hash']}")
+                processed_dict["imageHash"] = img['hash']
+        
+        # Join all parts with spaces for the string representation
+        metadata_str = " ".join(parts)
+        
+        return metadata_str, processed_dict
 
 class ThreeVectorCombiner(nn.Module):
     """
@@ -599,9 +889,27 @@ class ThreeVectorEmbedding:
             return image_features.squeeze()
         
         elif image_url is not None:
-            # This would download and process the image
-            # For simplicity, return a dummy vector
-            return torch.randn(1024)
+            # Download and process the image from URL
+            from PIL import Image
+            from io import BytesIO
+            
+            # Ensure URL ends with format=jpeg for compatibility
+            if not image_url.endswith("?format=jpeg"):
+                image_url = f"{image_url}?format=jpeg"
+            
+            # Download the image
+            response = requests.get(image_url, stream=True)
+            if response.status_code != 200:
+                raise ValueError(f"Failed to download image from URL: {image_url}, status code: {response.status_code}")
+            
+            # Convert to PIL Image
+            image = Image.open(BytesIO(response.content)).convert('RGB')
+            
+            # Process with CLIP
+            inputs = self.clip_processor(images=image, return_tensors="pt")
+            with torch.no_grad():
+                image_features = self.clip_model.get_image_features(**inputs)
+            return image_features.squeeze()
         
         else:
             raise ValueError("Must provide one of: image_path, image_url, or image_tensor")
@@ -613,6 +921,7 @@ class ThreeVectorEmbedding:
         if description is None:
             if image_url:
                 description = self.caption_generator.generate_caption(image_url)
+                print(description)
             elif image_path:
                 # In a real implementation, you'd need to host this image somewhere
                 # For this example, we'll just generate a placeholder caption
@@ -628,7 +937,7 @@ class ThreeVectorEmbedding:
         Get embedding for metadata.
         """
         # Process metadata to string
-        metadata_str = self.metadata_processor.process_metadata(metadata)
+        metadata_str, processed_dict = self.metadata_processor.process_metadata(metadata)
         
         # Get embedding
         return self.text_embedder.get_embedding(metadata_str)
@@ -660,6 +969,9 @@ class ThreeVectorEmbedding:
         Process a single item to get all three vectors and the combined vector.
         
         Item can be a dictionary with image_path/image_url, description, and metadata.
+        
+        Returns:
+            Dictionary with vectors and generated caption (if applicable)
         """
         # Get image vector
         if "image_path" in item:
@@ -671,13 +983,19 @@ class ThreeVectorEmbedding:
         else:
             raise ValueError("Item must contain image_path, image_url, or image_tensor")
         
+        # Track if we generate a caption
+        generated_caption = None
+        
         # Get text vector
-        if "description" in item:
+        if "description" in item and item["description"]:
             text_vector = self.get_text_vector(description=item["description"])
         elif "image_path" in item:
-            text_vector = self.get_text_vector(image_path=item["image_path"])
+            generated_caption = self.caption_generator.generate_caption("placeholder")
+            text_vector = self.get_text_vector(description=generated_caption)
         elif "image_url" in item:
-            text_vector = self.get_text_vector(image_url=item["image_url"])
+            generated_caption = self.caption_generator.generate_caption(item["image_url"])
+            print(generated_caption)
+            text_vector = self.get_text_vector(description=generated_caption)
         else:
             raise ValueError("Item must contain description, image_path, or image_url")
         
@@ -690,13 +1008,24 @@ class ThreeVectorEmbedding:
         
         # Get combined vector
         combined_vector = self.get_combined_vector(image_vector, text_vector, metadata_vector)
+
+        print("image_vector", image_vector)
+        print("text_vector", text_vector)
+        print("metadata_vector", metadata_vector)
+        print("combined_vector", combined_vector)
         
-        return {
+        result = {
             "image_vector": image_vector.detach().cpu().numpy(),
             "text_vector": text_vector.detach().cpu().numpy(),
             "metadata_vector": metadata_vector.detach().cpu().numpy(),
             "combined_vector": combined_vector.detach().cpu().numpy()
         }
+        
+        # Include the generated caption in the result if we generated one
+        if generated_caption:
+            result["generated_caption"] = generated_caption
+        
+        return result
     
     def process_dataset(self, input_parquet, output_parquet):
         """
